@@ -1,3 +1,4 @@
+#if UNITY_EDITOR
 using System.IO;
 using UnityEditor;
 using UnityEngine;
@@ -255,3 +256,4 @@ public class ToolsImporter : EditorWindow
         return "git"; // fallback theo PATH
     }
 }
+#endif
