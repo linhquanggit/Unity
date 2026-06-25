@@ -33,6 +33,7 @@ public class ToolsImporter : EditorWindow
     private string statusMessage = "Bấm Load để lấy danh sách package từ GitHub.";
     private Vector2 scrollPosition;
     private bool showConfig;
+    private string pendingImportFile; // file tạm đang chờ import xong để xoá
 
     [MenuItem("Tools/Unity Package Importer")]
     public static void ShowWindow()
@@ -48,6 +49,36 @@ public class ToolsImporter : EditorWindow
         branch = EditorPrefs.GetString(PrefBranch, "main");
         folder = EditorPrefs.GetString(PrefFolder, "Tools");
         scriptPath = EditorPrefs.GetString(PrefScriptPath, "Scripts/ToolsImporter.cs");
+
+        // Tự xoá file tạm sau khi import xong/huỷ/lỗi.
+        AssetDatabase.importPackageCompleted += OnImportFinished;
+        AssetDatabase.importPackageCancelled += OnImportFinished;
+        AssetDatabase.importPackageFailed += OnImportFailed;
+    }
+
+    private void OnDisable()
+    {
+        AssetDatabase.importPackageCompleted -= OnImportFinished;
+        AssetDatabase.importPackageCancelled -= OnImportFinished;
+        AssetDatabase.importPackageFailed -= OnImportFailed;
+        DeletePendingFile(); // dọn nốt nếu đóng window giữa chừng
+    }
+
+    private void OnImportFinished(string packageName) => DeletePendingFile();
+    private void OnImportFailed(string packageName, string error) => DeletePendingFile();
+
+    private void DeletePendingFile()
+    {
+        if (string.IsNullOrEmpty(pendingImportFile)) return;
+        try
+        {
+            if (File.Exists(pendingImportFile)) File.Delete(pendingImportFile);
+        }
+        catch (System.Exception e)
+        {
+            Debug.LogWarning($"[ToolsImporter] Không xoá được file tạm '{pendingImportFile}': {e.Message}");
+        }
+        pendingImportFile = null;
     }
 
     private void SaveConfig()
@@ -191,12 +222,11 @@ public class ToolsImporter : EditorWindow
             return;
         }
 
-        string cacheDir = Path.GetFullPath(Path.Combine(Application.dataPath, "..", "Temp", "ToolsImporterCache"));
-        string localPath = Path.Combine(cacheDir, pkg.name);
+        // Ghi vào OS temp (ngoài project) để không sinh thư mục cache trong project.
+        string localPath = Path.Combine(Path.GetTempPath(), pkg.name);
 
         try
         {
-            Directory.CreateDirectory(cacheDir);
             EditorUtility.DisplayProgressBar("Import", $"Đang tải {pkg.name} ({FormatSize(pkg.size)})...", 0.5f);
 
             using (var req = UnityWebRequest.Get(pkg.download_url))
@@ -211,6 +241,7 @@ public class ToolsImporter : EditorWindow
                     return;
                 }
                 File.WriteAllBytes(localPath, req.downloadHandler.data);
+                pendingImportFile = localPath; // sẽ tự xoá khi import xong/huỷ/lỗi
             }
         }
         catch (System.Exception e)
