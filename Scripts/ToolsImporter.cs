@@ -18,6 +18,7 @@ public class ToolsImporter : EditorWindow
     private const string PrefRepo = "ToolsImporter_Repo";
     private const string PrefBranch = "ToolsImporter_Branch";
     private const string PrefFolder = "ToolsImporter_Folder";
+    private const string PrefScriptPath = "ToolsImporter_ScriptPath";
 
     private const string UserAgent = "UnityEditor-ToolsImporter";
 
@@ -25,6 +26,7 @@ public class ToolsImporter : EditorWindow
     private string repo;
     private string branch;
     private string folder;
+    private string scriptPath; // đường dẫn script trong repo, để self-update fetch raw
 
     private GitHubContent[] remotePackages = new GitHubContent[0];
     private bool loaded;
@@ -45,6 +47,7 @@ public class ToolsImporter : EditorWindow
         repo = EditorPrefs.GetString(PrefRepo, "Unity");
         branch = EditorPrefs.GetString(PrefBranch, "main");
         folder = EditorPrefs.GetString(PrefFolder, "Tools");
+        scriptPath = EditorPrefs.GetString(PrefScriptPath, "Scripts/ToolsImporter.cs");
     }
 
     private void SaveConfig()
@@ -53,6 +56,7 @@ public class ToolsImporter : EditorWindow
         EditorPrefs.SetString(PrefRepo, repo);
         EditorPrefs.SetString(PrefBranch, branch);
         EditorPrefs.SetString(PrefFolder, folder);
+        EditorPrefs.SetString(PrefScriptPath, scriptPath);
     }
 
     private void OnGUI()
@@ -108,6 +112,7 @@ public class ToolsImporter : EditorWindow
         repo = EditorGUILayout.TextField("Repo", repo);
         branch = EditorGUILayout.TextField("Branch", branch);
         folder = EditorGUILayout.TextField("Folder", folder);
+        scriptPath = EditorGUILayout.TextField("Script path", scriptPath);
         if (EditorGUI.EndChangeCheck()) SaveConfig();
         EditorGUILayout.LabelField("API", $"github.com/{owner}/{repo} @ {branch}/{folder}", EditorStyles.miniLabel);
         EditorGUI.indentLevel--;
@@ -241,34 +246,45 @@ public class ToolsImporter : EditorWindow
     }
 
     // ----------------------------------------------------------------------
-    // Self-update qua git (pull repo chứa script này)
+    // Self-update: fetch script mới nhất từ GitHub (raw) rồi ghi đè chính nó
     // ----------------------------------------------------------------------
 
     private void UpdateImporter()
     {
-        string repoRoot = FindGitRoot(Path.GetFullPath(Path.Combine(Application.dataPath, "..")));
-        if (string.IsNullOrEmpty(repoRoot))
+        // Vị trí asset của chính script này trong project (vd: Assets/Editor/ToolsImporter.cs).
+        var mono = MonoScript.FromScriptableObject(this);
+        string assetPath = mono != null ? AssetDatabase.GetAssetPath(mono) : null;
+        if (string.IsNullOrEmpty(assetPath))
         {
-            EditorUtility.DisplayDialog(
-                "Update Importer",
-                "Không tìm thấy git repo (.git) từ project root.\n" +
-                "Self-update chỉ chạy khi project nằm trong git repository.",
-                "OK");
+            EditorUtility.DisplayDialog("Update Importer",
+                "Không xác định được vị trí script trong project.", "OK");
             return;
         }
+        string localFullPath = Path.GetFullPath(assetPath);
 
-        string output;
-        int exitCode;
-        EditorUtility.DisplayProgressBar("Update Importer", $"git pull tại:\n{repoRoot}", 0.5f);
+        string rawUrl = $"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{scriptPath}";
+        string newContent;
         try
         {
-            exitCode = RunGit(repoRoot, "pull --ff-only", out output);
+            EditorUtility.DisplayProgressBar("Update Importer", "Đang fetch script mới từ GitHub...", 0.5f);
+            using (var req = UnityWebRequest.Get(rawUrl))
+            {
+                req.SetRequestHeader("User-Agent", UserAgent);
+                SendBlocking(req);
+                if (!string.IsNullOrEmpty(req.error))
+                {
+                    Debug.LogError($"[ToolsImporter] Fetch lỗi: {req.error}\nURL: {rawUrl}");
+                    EditorUtility.DisplayDialog("Update Importer",
+                        $"Fetch lỗi:\n{req.error}\n\nURL: {rawUrl}", "OK");
+                    return;
+                }
+                newContent = req.downloadHandler.text;
+            }
         }
         catch (System.Exception e)
         {
-            EditorUtility.ClearProgressBar();
-            Debug.LogError($"[ToolsImporter] Không chạy được git: {e.Message}");
-            EditorUtility.DisplayDialog("Update Importer", $"Không chạy được git:\n{e.Message}", "OK");
+            Debug.LogError($"[ToolsImporter] Update exception: {e}");
+            EditorUtility.DisplayDialog("Update Importer", $"Lỗi: {e.Message}", "OK");
             return;
         }
         finally
@@ -276,69 +292,27 @@ public class ToolsImporter : EditorWindow
             EditorUtility.ClearProgressBar();
         }
 
-        if (exitCode == 0)
+        // Sanity check để không ghi đè bằng nội dung rác (vd trang 404).
+        if (string.IsNullOrEmpty(newContent) || !newContent.Contains("class ToolsImporter"))
         {
-            Debug.Log($"[ToolsImporter] git pull OK tại {repoRoot}\n{output}");
-            AssetDatabase.Refresh(); // biên dịch lại script đã cập nhật
-            EditorUtility.DisplayDialog("Update Importer", $"Cập nhật thành công.\n\n{output}", "OK");
+            EditorUtility.DisplayDialog("Update Importer",
+                $"Nội dung tải về không hợp lệ (không thấy class ToolsImporter).\nURL: {rawUrl}", "OK");
+            return;
         }
-        else
-        {
-            Debug.LogError($"[ToolsImporter] git pull thất bại (exit {exitCode})\n{output}");
-            EditorUtility.DisplayDialog("Update Importer", $"git pull thất bại (exit {exitCode}):\n\n{output}", "OK");
-        }
-    }
 
-    private static string FindGitRoot(string startDir)
-    {
-        try
+        string current = File.Exists(localFullPath) ? File.ReadAllText(localFullPath) : string.Empty;
+        if (current == newContent)
         {
-            var dir = new DirectoryInfo(startDir);
-            while (dir != null)
-            {
-                if (Directory.Exists(Path.Combine(dir.FullName, ".git")) ||
-                    File.Exists(Path.Combine(dir.FullName, ".git")))
-                {
-                    return dir.FullName;
-                }
-                dir = dir.Parent;
-            }
+            EditorUtility.DisplayDialog("Update Importer", "Đã là bản mới nhất, không có thay đổi.", "OK");
+            return;
         }
-        catch { /* ignore */ }
-        return null;
-    }
 
-    private static int RunGit(string workingDir, string args, out string output)
-    {
-        var psi = new System.Diagnostics.ProcessStartInfo
-        {
-            FileName = ResolveGitPath(),
-            Arguments = args,
-            WorkingDirectory = workingDir,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-            CreateNoWindow = true,
-        };
-
-        using (var process = System.Diagnostics.Process.Start(psi))
-        {
-            string stdout = process.StandardOutput.ReadToEnd();
-            string stderr = process.StandardError.ReadToEnd();
-            process.WaitForExit();
-            output = (stdout + "\n" + stderr).Trim();
-            return process.ExitCode;
-        }
-    }
-
-    private static string ResolveGitPath()
-    {
-        string[] candidates = { "/usr/bin/git", "/usr/local/bin/git", "/opt/homebrew/bin/git" };
-        foreach (var c in candidates)
-        {
-            if (File.Exists(c)) return c;
-        }
-        return "git";
+        File.WriteAllText(localFullPath, newContent);
+        AssetDatabase.ImportAsset(assetPath);
+        AssetDatabase.Refresh(); // Unity biên dịch lại -> tool tự cập nhật chính nó
+        Debug.Log($"[ToolsImporter] Đã cập nhật script từ {rawUrl} -> {assetPath}");
+        EditorUtility.DisplayDialog("Update Importer",
+            $"Đã cập nhật script từ GitHub:\n{assetPath}\n\nUnity sẽ biên dịch lại.", "OK");
     }
 
     // ---- JSON model cho GitHub Contents API ----
