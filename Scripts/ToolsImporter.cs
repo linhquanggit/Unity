@@ -1,169 +1,264 @@
 #if UNITY_EDITOR
 using System.IO;
+using System.Linq;
 using UnityEditor;
 using UnityEngine;
+using UnityEngine.Networking;
 
 /// <summary>
-/// Editor window quét một folder chứa các file .unitypackage và cho phép import từng package.
-/// Có nút "Update Importer" để git pull bản mới nhất (gồm cả chính script này) rồi tự biên dịch lại.
+/// Editor window: bấm "Load" để lấy danh sách .unitypackage từ repo GitHub,
+/// vẽ mỗi package thành một node; click node -> tải về và import vào project.
+/// Có nút "Update Importer" để git pull tự cập nhật chính script này.
 /// Mở qua menu: Tools > Unity Package Importer.
 /// </summary>
 public class ToolsImporter : EditorWindow
 {
-    private const string EditorPrefsKey = "UnityPackageImporter_PackageFolder";
+    // ---- Cấu hình repo (lưu EditorPrefs) ----
+    private const string PrefOwner = "ToolsImporter_Owner";
+    private const string PrefRepo = "ToolsImporter_Repo";
+    private const string PrefBranch = "ToolsImporter_Branch";
+    private const string PrefFolder = "ToolsImporter_Folder";
 
-    private string packageFolder;
-    private string[] packagePaths = new string[0];
+    private const string UserAgent = "UnityEditor-ToolsImporter";
+
+    private string owner;
+    private string repo;
+    private string branch;
+    private string folder;
+
+    private GitHubContent[] remotePackages = new GitHubContent[0];
+    private bool loaded;
+    private string statusMessage = "Bấm Load để lấy danh sách package từ GitHub.";
     private Vector2 scrollPosition;
+    private bool showConfig;
 
     [MenuItem("Tools/Unity Package Importer")]
     public static void ShowWindow()
     {
         var window = GetWindow<ToolsImporter>("Package Importer");
-        window.minSize = new Vector2(360, 260);
+        window.minSize = new Vector2(380, 300);
     }
 
     private void OnEnable()
     {
-        LoadSettings();
-        RefreshPackageList();
+        owner = EditorPrefs.GetString(PrefOwner, "linhquanggit");
+        repo = EditorPrefs.GetString(PrefRepo, "Unity");
+        branch = EditorPrefs.GetString(PrefBranch, "main");
+        folder = EditorPrefs.GetString(PrefFolder, "Tools");
     }
 
-    private void LoadSettings()
+    private void SaveConfig()
     {
-        packageFolder = EditorPrefs.GetString(EditorPrefsKey, string.Empty);
-        if (string.IsNullOrEmpty(packageFolder))
-        {
-            // Mặc định: folder Tools/ nằm cạnh project (../Tools so với Assets).
-            packageFolder = Path.GetFullPath(Path.Combine(Application.dataPath, "..", "Tools"));
-        }
-    }
-
-    private void SaveSettings()
-    {
-        EditorPrefs.SetString(EditorPrefsKey, packageFolder);
+        EditorPrefs.SetString(PrefOwner, owner);
+        EditorPrefs.SetString(PrefRepo, repo);
+        EditorPrefs.SetString(PrefBranch, branch);
+        EditorPrefs.SetString(PrefFolder, folder);
     }
 
     private void OnGUI()
     {
         EditorGUILayout.Space();
         EditorGUILayout.LabelField("Unity Package Importer", EditorStyles.boldLabel);
-        EditorGUILayout.HelpBox("Chọn folder chứa các file .unitypackage, rồi bấm Import để nạp package vào project.", MessageType.Info);
 
-        EditorGUILayout.BeginHorizontal();
-        EditorGUILayout.LabelField("Package folder", GUILayout.Width(100));
-        EditorGUI.BeginChangeCheck();
-        packageFolder = EditorGUILayout.TextField(packageFolder);
-        if (EditorGUI.EndChangeCheck())
-        {
-            SaveSettings();
-            RefreshPackageList();
-        }
-        if (GUILayout.Button("Browse", GUILayout.Width(80)))
-        {
-            var selected = EditorUtility.OpenFolderPanel("Select Tools Folder", packageFolder, "");
-            if (!string.IsNullOrEmpty(selected))
-            {
-                packageFolder = selected;
-                SaveSettings();
-                RefreshPackageList();
-                GUIUtility.ExitGUI();
-            }
-        }
-        EditorGUILayout.EndHorizontal();
+        DrawConfig();
 
         EditorGUILayout.Space();
 
-        // Self-update: kéo bản mới nhất từ git rồi biên dịch lại.
+        // ---- Load + Update ----
+        EditorGUILayout.BeginHorizontal();
         var prevColor = GUI.backgroundColor;
+        GUI.backgroundColor = new Color(0.55f, 0.85f, 0.55f);
+        if (GUILayout.Button("⤓ Load", GUILayout.Height(28)))
+        {
+            LoadFromGit();
+            GUIUtility.ExitGUI();
+        }
         GUI.backgroundColor = new Color(0.5f, 0.8f, 1f);
-        if (GUILayout.Button("⟳ Update Importer (git pull)", GUILayout.Height(26)))
+        if (GUILayout.Button("⟳ Update Importer", GUILayout.Height(28), GUILayout.Width(150)))
         {
             UpdateImporter();
             GUIUtility.ExitGUI();
         }
         GUI.backgroundColor = prevColor;
+        EditorGUILayout.EndHorizontal();
 
         EditorGUILayout.Space();
+        EditorGUILayout.HelpBox(statusMessage, loaded && remotePackages.Length > 0 ? MessageType.Info : MessageType.None);
 
-        if (!Directory.Exists(packageFolder))
+        if (!loaded) return;
+
+        if (remotePackages.Length == 0)
         {
-            EditorGUILayout.HelpBox($"Folder không tồn tại:\n{packageFolder}", MessageType.Warning);
-            if (GUILayout.Button("Refresh"))
-            {
-                RefreshPackageList();
-            }
+            EditorGUILayout.HelpBox($"Không có .unitypackage nào trong '{folder}' trên repo.", MessageType.Warning);
             return;
         }
 
-        if (GUILayout.Button("Refresh Package List"))
-        {
-            RefreshPackageList();
-        }
+        EditorGUILayout.LabelField($"{remotePackages.Length} package — click để import:", EditorStyles.boldLabel);
+        DrawNodes();
+    }
 
-        EditorGUILayout.Space();
+    private void DrawConfig()
+    {
+        showConfig = EditorGUILayout.Foldout(showConfig, "Repo config", true);
+        if (!showConfig) return;
 
-        if (packagePaths.Length == 0)
-        {
-            EditorGUILayout.HelpBox("Không tìm thấy file .unitypackage nào trong folder.", MessageType.Info);
-            return;
-        }
+        EditorGUI.indentLevel++;
+        EditorGUI.BeginChangeCheck();
+        owner = EditorGUILayout.TextField("Owner", owner);
+        repo = EditorGUILayout.TextField("Repo", repo);
+        branch = EditorGUILayout.TextField("Branch", branch);
+        folder = EditorGUILayout.TextField("Folder", folder);
+        if (EditorGUI.EndChangeCheck()) SaveConfig();
+        EditorGUILayout.LabelField("API", $"github.com/{owner}/{repo} @ {branch}/{folder}", EditorStyles.miniLabel);
+        EditorGUI.indentLevel--;
+    }
 
-        EditorGUILayout.LabelField($"Tìm thấy {packagePaths.Length} package:", EditorStyles.boldLabel);
+    private void DrawNodes()
+    {
         scrollPosition = EditorGUILayout.BeginScrollView(scrollPosition);
-        foreach (var path in packagePaths)
+        foreach (var pkg in remotePackages)
         {
-            if (GUILayout.Button(Path.GetFileNameWithoutExtension(path), GUILayout.Height(24)))
+            EditorGUILayout.BeginVertical(EditorStyles.helpBox);
+            if (GUILayout.Button(pkg.name, EditorStyles.boldLabel))
             {
-                ImportPackage(path);
+                DownloadAndImport(pkg);
+                GUIUtility.ExitGUI();
             }
+            EditorGUILayout.LabelField(FormatSize(pkg.size), EditorStyles.miniLabel);
+            EditorGUILayout.EndVertical();
         }
         EditorGUILayout.EndScrollView();
     }
 
-    private void RefreshPackageList()
+    // ----------------------------------------------------------------------
+    // Load danh sách package từ GitHub API
+    // ----------------------------------------------------------------------
+
+    private void LoadFromGit()
     {
-        packagePaths = Directory.Exists(packageFolder)
-            ? Directory.GetFiles(packageFolder, "*.unitypackage", SearchOption.TopDirectoryOnly)
-            : new string[0];
+        string url = $"https://api.github.com/repos/{owner}/{repo}/contents/{folder}?ref={branch}";
+        try
+        {
+            EditorUtility.DisplayProgressBar("Load", "Đang lấy danh sách package từ GitHub...", 0.5f);
+            using (var req = UnityWebRequest.Get(url))
+            {
+                req.SetRequestHeader("User-Agent", UserAgent);
+                req.SetRequestHeader("Accept", "application/vnd.github+json");
+                SendBlocking(req);
+
+                if (!string.IsNullOrEmpty(req.error))
+                {
+                    string body = req.downloadHandler != null ? req.downloadHandler.text : string.Empty;
+                    Debug.LogError($"[ToolsImporter] Load lỗi: {req.error}\n{body}");
+                    statusMessage = $"Load lỗi: {req.error}";
+                    remotePackages = new GitHubContent[0];
+                    loaded = true;
+                    return;
+                }
+
+                string json = req.downloadHandler.text;
+                var list = JsonUtility.FromJson<GitHubContentList>("{\"items\":" + json + "}");
+                remotePackages = (list != null && list.items != null ? list.items : new GitHubContent[0])
+                    .Where(c => c.type == "file" && c.name != null && c.name.EndsWith(".unitypackage"))
+                    .ToArray();
+                loaded = true;
+                statusMessage = $"Đã load {remotePackages.Length} package từ {owner}/{repo}@{branch}/{folder}.";
+            }
+        }
+        catch (System.Exception e)
+        {
+            Debug.LogError($"[ToolsImporter] Load exception: {e}");
+            statusMessage = $"Load exception: {e.Message}";
+            remotePackages = new GitHubContent[0];
+            loaded = true;
+        }
+        finally
+        {
+            EditorUtility.ClearProgressBar();
+        }
     }
 
-    private void ImportPackage(string path)
+    private void DownloadAndImport(GitHubContent pkg)
     {
-        if (!File.Exists(path))
+        if (string.IsNullOrEmpty(pkg.download_url))
         {
-            Debug.LogError($"Package không tồn tại: {path}");
-            RefreshPackageList();
+            EditorUtility.DisplayDialog("Import", $"Package '{pkg.name}' không có download_url.", "OK");
             return;
         }
 
+        string cacheDir = Path.GetFullPath(Path.Combine(Application.dataPath, "..", "Temp", "ToolsImporterCache"));
+        string localPath = Path.Combine(cacheDir, pkg.name);
+
+        try
+        {
+            Directory.CreateDirectory(cacheDir);
+            EditorUtility.DisplayProgressBar("Import", $"Đang tải {pkg.name} ({FormatSize(pkg.size)})...", 0.5f);
+
+            using (var req = UnityWebRequest.Get(pkg.download_url))
+            {
+                req.SetRequestHeader("User-Agent", UserAgent);
+                SendBlocking(req);
+
+                if (!string.IsNullOrEmpty(req.error))
+                {
+                    Debug.LogError($"[ToolsImporter] Tải '{pkg.name}' lỗi: {req.error}");
+                    EditorUtility.DisplayDialog("Import", $"Tải '{pkg.name}' lỗi:\n{req.error}", "OK");
+                    return;
+                }
+                File.WriteAllBytes(localPath, req.downloadHandler.data);
+            }
+        }
+        catch (System.Exception e)
+        {
+            Debug.LogError($"[ToolsImporter] Import exception: {e}");
+            EditorUtility.DisplayDialog("Import", $"Lỗi: {e.Message}", "OK");
+            return;
+        }
+        finally
+        {
+            EditorUtility.ClearProgressBar();
+        }
+
         // interactive = true: Unity hiện cửa sổ chọn asset để import.
-        AssetDatabase.ImportPackage(path, true);
+        AssetDatabase.ImportPackage(localPath, true);
+    }
+
+    /// <summary>Gửi UnityWebRequest và chờ xong (blocking, dùng trong editor).</summary>
+    private static void SendBlocking(UnityWebRequest req)
+    {
+        var op = req.SendWebRequest();
+        while (!op.isDone)
+        {
+            System.Threading.Thread.Sleep(10);
+        }
+    }
+
+    private static string FormatSize(long bytes)
+    {
+        if (bytes >= 1024 * 1024) return $"{bytes / (1024f * 1024f):0.0} MB";
+        if (bytes >= 1024) return $"{bytes / 1024f:0.0} KB";
+        return $"{bytes} B";
     }
 
     // ----------------------------------------------------------------------
-    // Self-update qua git
+    // Self-update qua git (pull repo chứa script này)
     // ----------------------------------------------------------------------
 
     private void UpdateImporter()
     {
-        // Tìm git repo: ưu tiên từ folder Tools, sau đó từ project root.
-        string repoRoot = FindGitRoot(packageFolder)
-                          ?? FindGitRoot(Path.GetFullPath(Path.Combine(Application.dataPath, "..")));
-
+        string repoRoot = FindGitRoot(Path.GetFullPath(Path.Combine(Application.dataPath, "..")));
         if (string.IsNullOrEmpty(repoRoot))
         {
             EditorUtility.DisplayDialog(
                 "Update Importer",
-                "Không tìm thấy git repo (.git) từ folder Tools hoặc project root.\n" +
-                "Hãy chắc chắn script & Tools nằm trong một git repository.",
+                "Không tìm thấy git repo (.git) từ project root.\n" +
+                "Self-update chỉ chạy khi project nằm trong git repository.",
                 "OK");
             return;
         }
 
         string output;
         int exitCode;
-
         EditorUtility.DisplayProgressBar("Update Importer", $"git pull tại:\n{repoRoot}", 0.5f);
         try
         {
@@ -184,9 +279,7 @@ public class ToolsImporter : EditorWindow
         if (exitCode == 0)
         {
             Debug.Log($"[ToolsImporter] git pull OK tại {repoRoot}\n{output}");
-            RefreshPackageList();
-            // Refresh để Unity import package mới và biên dịch lại script đã cập nhật (tool tự update chính nó).
-            AssetDatabase.Refresh();
+            AssetDatabase.Refresh(); // biên dịch lại script đã cập nhật
             EditorUtility.DisplayDialog("Update Importer", $"Cập nhật thành công.\n\n{output}", "OK");
         }
         else
@@ -196,7 +289,6 @@ public class ToolsImporter : EditorWindow
         }
     }
 
-    /// <summary>Đi ngược lên cây thư mục tìm folder chứa .git.</summary>
     private static string FindGitRoot(string startDir)
     {
         try
@@ -216,7 +308,6 @@ public class ToolsImporter : EditorWindow
         return null;
     }
 
-    /// <summary>Chạy git với working dir cho trước. Trả exit code, gom stdout+stderr vào output.</summary>
     private static int RunGit(string workingDir, string args, out string output)
     {
         var psi = new System.Diagnostics.ProcessStartInfo
@@ -240,20 +331,31 @@ public class ToolsImporter : EditorWindow
         }
     }
 
-    /// <summary>Tìm đường dẫn git (process do Unity khởi chạy có thể thiếu PATH đầy đủ).</summary>
     private static string ResolveGitPath()
     {
-        string[] candidates =
-        {
-            "/usr/bin/git",
-            "/usr/local/bin/git",
-            "/opt/homebrew/bin/git",
-        };
+        string[] candidates = { "/usr/bin/git", "/usr/local/bin/git", "/opt/homebrew/bin/git" };
         foreach (var c in candidates)
         {
             if (File.Exists(c)) return c;
         }
-        return "git"; // fallback theo PATH
+        return "git";
+    }
+
+    // ---- JSON model cho GitHub Contents API ----
+    [System.Serializable]
+    private class GitHubContent
+    {
+        public string name;
+        public string path;
+        public string type;
+        public long size;
+        public string download_url;
+    }
+
+    [System.Serializable]
+    private class GitHubContentList
+    {
+        public GitHubContent[] items;
     }
 }
 #endif
