@@ -4,6 +4,7 @@ using UnityEngine;
 
 /// <summary>
 /// Editor window quét một folder chứa các file .unitypackage và cho phép import từng package.
+/// Có nút "Update Importer" để git pull bản mới nhất (gồm cả chính script này) rồi tự biên dịch lại.
 /// Mở qua menu: Tools > Unity Package Importer.
 /// </summary>
 public class ToolsImporter : EditorWindow
@@ -18,7 +19,7 @@ public class ToolsImporter : EditorWindow
     public static void ShowWindow()
     {
         var window = GetWindow<ToolsImporter>("Package Importer");
-        window.minSize = new Vector2(360, 240);
+        window.minSize = new Vector2(360, 260);
     }
 
     private void OnEnable()
@@ -69,6 +70,18 @@ public class ToolsImporter : EditorWindow
             }
         }
         EditorGUILayout.EndHorizontal();
+
+        EditorGUILayout.Space();
+
+        // Self-update: kéo bản mới nhất từ git rồi biên dịch lại.
+        var prevColor = GUI.backgroundColor;
+        GUI.backgroundColor = new Color(0.5f, 0.8f, 1f);
+        if (GUILayout.Button("⟳ Update Importer (git pull)", GUILayout.Height(26)))
+        {
+            UpdateImporter();
+            GUIUtility.ExitGUI();
+        }
+        GUI.backgroundColor = prevColor;
 
         EditorGUILayout.Space();
 
@@ -125,5 +138,120 @@ public class ToolsImporter : EditorWindow
 
         // interactive = true: Unity hiện cửa sổ chọn asset để import.
         AssetDatabase.ImportPackage(path, true);
+    }
+
+    // ----------------------------------------------------------------------
+    // Self-update qua git
+    // ----------------------------------------------------------------------
+
+    private void UpdateImporter()
+    {
+        // Tìm git repo: ưu tiên từ folder Tools, sau đó từ project root.
+        string repoRoot = FindGitRoot(packageFolder)
+                          ?? FindGitRoot(Path.GetFullPath(Path.Combine(Application.dataPath, "..")));
+
+        if (string.IsNullOrEmpty(repoRoot))
+        {
+            EditorUtility.DisplayDialog(
+                "Update Importer",
+                "Không tìm thấy git repo (.git) từ folder Tools hoặc project root.\n" +
+                "Hãy chắc chắn script & Tools nằm trong một git repository.",
+                "OK");
+            return;
+        }
+
+        string output;
+        int exitCode;
+
+        EditorUtility.DisplayProgressBar("Update Importer", $"git pull tại:\n{repoRoot}", 0.5f);
+        try
+        {
+            exitCode = RunGit(repoRoot, "pull --ff-only", out output);
+        }
+        catch (System.Exception e)
+        {
+            EditorUtility.ClearProgressBar();
+            Debug.LogError($"[ToolsImporter] Không chạy được git: {e.Message}");
+            EditorUtility.DisplayDialog("Update Importer", $"Không chạy được git:\n{e.Message}", "OK");
+            return;
+        }
+        finally
+        {
+            EditorUtility.ClearProgressBar();
+        }
+
+        if (exitCode == 0)
+        {
+            Debug.Log($"[ToolsImporter] git pull OK tại {repoRoot}\n{output}");
+            RefreshPackageList();
+            // Refresh để Unity import package mới và biên dịch lại script đã cập nhật (tool tự update chính nó).
+            AssetDatabase.Refresh();
+            EditorUtility.DisplayDialog("Update Importer", $"Cập nhật thành công.\n\n{output}", "OK");
+        }
+        else
+        {
+            Debug.LogError($"[ToolsImporter] git pull thất bại (exit {exitCode})\n{output}");
+            EditorUtility.DisplayDialog("Update Importer", $"git pull thất bại (exit {exitCode}):\n\n{output}", "OK");
+        }
+    }
+
+    /// <summary>Đi ngược lên cây thư mục tìm folder chứa .git.</summary>
+    private static string FindGitRoot(string startDir)
+    {
+        try
+        {
+            var dir = new DirectoryInfo(startDir);
+            while (dir != null)
+            {
+                if (Directory.Exists(Path.Combine(dir.FullName, ".git")) ||
+                    File.Exists(Path.Combine(dir.FullName, ".git")))
+                {
+                    return dir.FullName;
+                }
+                dir = dir.Parent;
+            }
+        }
+        catch { /* ignore */ }
+        return null;
+    }
+
+    /// <summary>Chạy git với working dir cho trước. Trả exit code, gom stdout+stderr vào output.</summary>
+    private static int RunGit(string workingDir, string args, out string output)
+    {
+        var psi = new System.Diagnostics.ProcessStartInfo
+        {
+            FileName = ResolveGitPath(),
+            Arguments = args,
+            WorkingDirectory = workingDir,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+        };
+
+        using (var process = System.Diagnostics.Process.Start(psi))
+        {
+            string stdout = process.StandardOutput.ReadToEnd();
+            string stderr = process.StandardError.ReadToEnd();
+            process.WaitForExit();
+            output = (stdout + "\n" + stderr).Trim();
+            return process.ExitCode;
+        }
+    }
+
+    /// <summary>Tìm đường dẫn git (process do Unity khởi chạy có thể thiếu PATH đầy đủ).</summary>
+    private static string ResolveGitPath()
+    {
+        string[] candidates =
+        {
+            "/usr/bin/git",
+            "/usr/local/bin/git",
+            "/opt/homebrew/bin/git",
+        };
+        foreach (var c in candidates)
+        {
+            if (File.Exists(c)) return c;
+        }
+        return "git"; // fallback theo PATH
     }
 }
